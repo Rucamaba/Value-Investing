@@ -1,0 +1,15 @@
+# Core Libraries for Analysis
+yfinance
+pandas
+pandas-ta
+tabulate
+
+# Libraries for Ticker Generation Script (generate_tickers.py)
+requests
+beautifulsoup4
+lxml
+
+# System-level dependencies that may be required
+brotli
+selenium
+webdriver-manager
