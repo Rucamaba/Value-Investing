@@ -6,6 +6,7 @@ import yfinance as yf
 import pandas as pd
 import os
 import numpy as np
+import argparse
 from markets import get_tickers_from_csv
 import time
 from datetime import datetime
@@ -122,7 +123,16 @@ def score_moat(info, financials, cashflow, balance_sheet, total_debt, cash):
             score += 1
     except KeyError:
         pass
-        
+
+    # 5. Capacidad de pago de intereses (Interest Coverage > 5)
+    try:
+        ebit = financials.loc['EBIT'].iloc[0]
+        interest_exp = abs(financials.loc['Interest Expense'].iloc[0])
+        if interest_exp > 0 and (ebit / interest_exp) > 5:
+            score += 1
+    except:
+        pass
+
     return score
 
 def calculate_intrinsic_value(fcf_current, g_ultra_pessimistic, g_pessimistic, g_normal, g_optimistic, g_ultra_optimistic,
@@ -348,15 +358,74 @@ def analyze_ticker(ticker_symbol):
         },
         "intrinsic_value": intrinsic_values,
         "margin_of_safety": margin_of_safety,
+        "company_name": info.get("longName"),
     }
 
 
+def print_single_ticker_report(analysis):
+    """
+    Prints a detailed report for a single ticker in terminal.
+    """
+    if not analysis:
+        print(f"{Colors.RED}No se pudo analizar el ticker solicitado.{Colors.RESET}")
+        return
+
+    print("\n" + "=" * 70)
+    company_name = analysis.get('company_name', analysis['ticker'])
+    print(f"ANALISIS INDIVIDUAL: {company_name} ({analysis['ticker']})")
+    print("=" * 70)
+
+    if isinstance(analysis.get("price"), (int, float)):
+        print(f"Precio actual: ${analysis['price']:.2f}")
+    else:
+        print("Precio actual: N/A")
+
+    print(f"MOAT Score: {analysis.get('moat_score', 'N/A')}/7")
+
+    print("\n--- VALOR INTRINSECO Y MARGEN DE SEGURIDAD ---")
+    for scenario in ["Ultra Pessimistic", "Pessimistic", "Normal", "Optimistic", "Ultra Optimistic"]:
+        iv = analysis.get("intrinsic_value", {}).get(scenario)
+        mos = analysis.get("margin_of_safety", {}).get(scenario)
+        iv_text = f"${iv:.2f}" if isinstance(iv, (int, float)) else str(iv)
+        mos_text = f"{mos:.2%}" if isinstance(mos, (int, float)) else "N/A"
+        print(f"{scenario:<18}: IV {iv_text:>12} | MOS {mos_text:>8}")
+
+    reason = analysis.get("error_reason")
+    if reason:
+        print(f"\n{Colors.YELLOW}Aviso: {reason}{Colors.RESET}")
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Analizador Value Investing: mercado completo o ticker individual."
+    )
+    parser.add_argument(
+        "-t",
+        "--ticker",
+        type=str,
+        help="Ticker individual a analizar (ejemplo: AAPL o SAN.MC).",
+    )
+    args = parser.parse_args()
+
     print("\n" + "="*50)
     print("--- Starting Value Investing Analysis ---")
     print("="*50)
     
     start_time = time.time()
+
+    if args.ticker:
+        ticker = args.ticker.strip().upper()
+        print(f"--> Analizando ticker individual: {ticker}")
+        single_result = analyze_ticker(ticker)
+        print_single_ticker_report(single_result)
+
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"\n" + "=" * 50)
+        print(f"Tiempo total: {int(execution_time // 60)} min {int(execution_time % 60)} seg.")
+        print("=" * 50)
+        raise SystemExit(0)
+
     # --- CARGA DE TICKERS ---
     market_files = [os.path.join("data", f) for f in os.listdir("data") if f.endswith(".csv")]
     all_tickers = []
@@ -398,8 +467,28 @@ if __name__ == "__main__":
                     else:
                         mos_str = f"{Colors.YELLOW}{reason if reason else 'N/A'}{Colors.RESET}"
                     
-                    # Color verde solo si cumple tus criterios de compra
-                    is_gem = isinstance(mos_normal, float) and mos_normal > 0.2 and moat >= 3
+                    # --- FILTROS DE CALIDAD Y SEGURIDAD (Criterios de Inversión Real) ---
+                    # 1. Recuperamos métricas clave
+                    solvency = analysis.get("solvency", {})
+                    profitability = analysis.get("profitability", {})
+                    debt_to_equity = solvency.get("Debt-to-Equity")
+                    op_margin = profitability.get("Operating Margin")
+                    roe = profitability.get("ROE")
+
+                    # 2. Definimos los "Red Flags" (Banderas Rojas)
+                    is_bankrupt_risk = (debt_to_equity is not None and debt_to_equity > 250) # Exceso de deuda
+                    is_losing_money = (op_margin is not None and op_margin < 0.02)          # Margen < 2%
+                    is_fake_roe = (roe is not None and roe > 1.0)                          # ROE > 100% suele ser distorsión
+
+                    # 3. Nueva definición de Gema (MOS > 20%, Moat sólido Y sin señales de quiebra)
+                    is_gem = (
+                        isinstance(mos_normal, float) and mos_normal > 0.2 and 
+                        moat >= 3 and 
+                        not is_bankrupt_risk and 
+                        not is_losing_money and 
+                        not is_fake_roe
+                    )
+
                     status_color = Colors.GREEN if is_gem else ""
                     
                     print(f"[{i}/{total_tickers}] {status_color}Analyzed: {ticker:<8} | Moat: {moat} | MOS: {mos_str}{Colors.RESET}")
@@ -428,7 +517,7 @@ if __name__ == "__main__":
             f.write(f"{'Ticker':<10} | {'Precio':<10} | {'V.I. Normal':<12} | {'Margen (MOS)':<12} | {'MOAT'}\n")
             f.write("-" * 81 + "\n")
             for op in undervalued_opportunities:
-                f.write(f"{op['ticker']:<10} | ${op['price']:<9.2f} | ${op['intrinsic_value']['Normal']:<11.2f} | {op['margin_of_safety']['Normal']:<12.2%} | {op['moat_score']}/6\n")
+                f.write(f"{op['ticker']:<10} | ${op['price']:<9.2f} | ${op['intrinsic_value']['Normal']:<11.2f} | {op['margin_of_safety']['Normal']:<12.2%} | {op['moat_score']}/7\n")
             
             f.write("\n\n")
 
@@ -442,7 +531,7 @@ if __name__ == "__main__":
                 f.write(f"### ANÁLISIS DE {analysis['ticker']}\n")
                 f.write(f"{'#'*60}\n")
                 f.write(f"Current Price: ${analysis['price']:.2f}\n")
-                f.write(f"MOAT Score: {analysis['moat_score']}/6\n")
+                f.write(f"MOAT Score: {analysis['moat_score']}/7\n")
 
                 f.write("\n--- VALUATION ---\n")
                 for key, value in analysis["valuation"].items():
