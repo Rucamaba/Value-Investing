@@ -38,9 +38,9 @@ def get_financial_data(ticker_symbol):
     """
     for attempt in range(3): 
         try:
-            # 1. Pausa aleatoria ANTES de pedir datos (crucial para 5 hilos)
+            # 1. Pausa aleatoria ANTES de pedir datos (crucial para 8 hilos)
             # Aumentamos un poco el rango para dar respiro a la API
-            time.sleep(random.uniform(1.5, 3.0))
+            time.sleep(random.uniform(2.0, 3.5))
             
             # 2. Creamos el objeto Ticker SIN pasarle session
             ticker = yf.Ticker(ticker_symbol)
@@ -246,6 +246,31 @@ def analyze_ticker(ticker_symbol):
     except:
         roic = info.get("returnOnInvestedCapital") # Fallback al dato de Yahoo
 
+    # EBITDA: EBIT + Depreciation & Amortization
+    try:
+        ebit = financials.loc['EBIT'].iloc[0]
+        da = financials.loc['Depreciation And Amortization'].iloc[0]
+        ebitda = ebit + da
+    except:
+        ebitda = info.get("ebitda") # Fallback al dato de Yahoo
+    # EBITDA Growth (3Y): CAGR de EBITDA para los últimos 3 años
+    try:
+        ebitda_series = (financials.loc['EBIT'] + financials.loc['Depreciation And Amortization']).dropna()
+        if len(ebitda_series) >= 4:
+            ebitda_now = ebitda_series.iloc[0]
+            ebitda_3y_ago = ebitda_series.iloc[3]
+
+            # Solo calculamos si ambos son positivos para evitar errores matemáticos
+            if ebitda_now > 0 and ebitda_3y_ago > 0:
+                ebitda_growth_3y = (ebitda_now / ebitda_3y_ago) ** (1/3) - 1
+            else:
+                ebitda_growth_3y = None
+        else:
+            ebitda_growth_3y = None
+    except:
+        ebitda_growth_3y = None
+
+
     gross_margin = info.get("grossMargins")
     operating_margin = info.get("operatingMargins")
 
@@ -349,6 +374,8 @@ def analyze_ticker(ticker_symbol):
         "profitability": {
             "ROE": roe,
             "ROIC": roic,
+            "EBITDA": ebitda,
+            "EBITDA Growth (3Y)": ebitda_growth_3y,
             "Gross Margin": gross_margin,
             "Operating Margin": operating_margin,
         },
@@ -360,6 +387,82 @@ def analyze_ticker(ticker_symbol):
         "margin_of_safety": margin_of_safety,
         "company_name": info.get("longName"),
     }
+
+
+def save_analysis_txt(analysis):
+    """
+    Saves the full analysis as a human-readable .txt under analisis-accion/<TICKER>/<YYYY-MM-DD>.txt
+    """
+    try:
+        ticker = analysis.get('ticker')
+        base_dir = os.path.join(os.getcwd(), "analisis-accion", ticker)
+        os.makedirs(base_dir, exist_ok=True)
+        file_path = os.path.join(base_dir, datetime.now().strftime("%Y-%m-%d") + ".txt")
+
+        lines = []
+        lines.append("=" * 80)
+        lines.append(f"ANALISIS DE {analysis.get('company_name', ticker)} - {ticker}")
+        lines.append("=" * 80)
+        lines.append(f"Precio actual: ${analysis.get('price'):.2f}" if isinstance(analysis.get('price'), (int, float)) else "Precio actual: N/A")
+        lines.append(f"MOAT Score: {analysis.get('moat_score', 'N/A')}/7")
+        lines.append("")
+
+        lines.append("--- VALUATION ---")
+        for key, value in analysis.get('valuation', {}).items():
+            lines.append(f"{key}: {value:.2f}" if isinstance(value, (int, float)) else f"{key}: N/A")
+
+        lines.append("")
+        lines.append("--- SOLVENCY & HEALTH ---")
+        for key, value in analysis.get('solvency', {}).items():
+            if key == 'Net Debt' and isinstance(value, (int, float)):
+                lines.append(f"{key}: ${value:,.0f}")
+            else:
+                lines.append(f"{key}: {value:.2f}" if isinstance(value, (int, float)) else f"{key}: N/A")
+
+        lines.append("")
+        lines.append("--- PROFITABILITY & EFFICIENCY ---")
+        for key, value in analysis.get('profitability', {}).items():
+            if key == 'EBITDA' and isinstance(value, (int, float)):
+                lines.append(f"{key}: ${value:,.0f}")
+            elif key == 'EBITDA Growth (3Y)' and isinstance(value, (int, float)):
+                lines.append(f"{key}: {value:.2%}")
+            else:
+                lines.append(f"{key}: {value:.2%}" if isinstance(value, (int, float)) else f"{key}: N/A")
+
+        lines.append("")
+        lines.append("--- CASH FLOW ---")
+        for key, value in analysis.get('cash_flow', {}).items():
+            if 'Free Cash Flow' in key and isinstance(value, (int, float)):
+                lines.append(f"{key}: ${value:,.0f}")
+            elif 'Yield' in key and isinstance(value, (int, float)):
+                val = value/100 if value > 1 else value
+                lines.append(f"{key}: {val:.2%}")
+            else:
+                lines.append(f"{key}: N/A")
+
+        lines.append("")
+        lines.append("--- INTRINSIC VALUE & MARGIN OF SAFETY ---")
+        for scenario in ["Ultra Pessimistic", "Pessimistic", "Normal", "Optimistic", "Ultra Optimistic"]:
+            iv = analysis.get('intrinsic_value', {}).get(scenario)
+            mos = analysis.get('margin_of_safety', {}).get(scenario)
+            if isinstance(iv, (int, float)) and isinstance(mos, (int, float)):
+                lines.append(f"{scenario:<18}: IV ${iv:>8.2f} | MOS {mos:>8.2%}")
+            else:
+                iv_text = f"${iv:.2f}" if isinstance(iv, (int, float)) else "N/A"
+                mos_text = f"{mos:.2%}" if isinstance(mos, (int, float)) else "N/A"
+                lines.append(f"{scenario:<18}: IV {iv_text} | MOS {mos_text}")
+
+        reason = analysis.get('error_reason')
+        if reason:
+            lines.append("")
+            lines.append(f"Aviso: {reason}")
+
+        with open(file_path, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(lines))
+
+        print(f"{Colors.GREEN}Saved analysis TXT: {file_path}{Colors.RESET}")
+    except Exception as e:
+        print(f"{Colors.RED}Failed to save analysis TXT: {e}{Colors.RESET}")
 
 
 def print_single_ticker_report(analysis):
@@ -382,17 +485,53 @@ def print_single_ticker_report(analysis):
 
     print(f"MOAT Score: {analysis.get('moat_score', 'N/A')}/7")
 
-    print("\n--- VALOR INTRINSECO Y MARGEN DE SEGURIDAD ---")
-    for scenario in ["Ultra Pessimistic", "Pessimistic", "Normal", "Optimistic", "Ultra Optimistic"]:
-        iv = analysis.get("intrinsic_value", {}).get(scenario)
-        mos = analysis.get("margin_of_safety", {}).get(scenario)
-        iv_text = f"${iv:.2f}" if isinstance(iv, (int, float)) else str(iv)
-        mos_text = f"{mos:.2%}" if isinstance(mos, (int, float)) else "N/A"
-        print(f"{scenario:<18}: IV {iv_text:>12} | MOS {mos_text:>8}")
+    print("\n--- VALUATION ---")
+    for key, value in analysis.get('valuation', {}).items():
+        print(f"{key}: {value:.2f}" if isinstance(value, (int, float)) else f"{key}: N/A")
 
-    reason = analysis.get("error_reason")
+    print("\n--- SOLVENCY & HEALTH ---")
+    for key, value in analysis.get('solvency', {}).items():
+        if key == 'Net Debt' and isinstance(value, (int, float)):
+            print(f"{key}: ${value:,.0f}")
+        else:
+            print(f"{key}: {value:.2f}" if isinstance(value, (int, float)) else f"{key}: N/A")
+
+    print("\n--- PROFITABILITY & EFFICIENCY ---")
+    for key, value in analysis.get('profitability', {}).items():
+        if key == 'EBITDA' and isinstance(value, (int, float)):
+            print(f"{key}: ${value:,.0f}")
+        elif key == 'EBITDA Growth (3Y)' and isinstance(value, (int, float)):
+            print(f"{key}: {value:.2%}")
+        else:
+            print(f"{key}: {value:.2%}" if isinstance(value, (int, float)) else f"{key}: N/A")
+
+    print("\n--- CASH FLOW ---")
+    for key, value in analysis.get('cash_flow', {}).items():
+        if 'Free Cash Flow' in key and isinstance(value, (int, float)):
+            print(f"{key}: ${value:,.0f}")
+        elif 'Yield' in key and isinstance(value, (int, float)):
+            val = value/100 if value > 1 else value
+            print(f"{key}: {val:.2%}")
+        else:
+            print(f"{key}: N/A")
+
+    print("\n--- INTRINSIC VALUE & MARGIN OF SAFETY ---")
+    for scenario in ["Ultra Pessimistic", "Pessimistic", "Normal", "Optimistic", "Ultra Optimistic"]:
+        iv = analysis.get('intrinsic_value', {}).get(scenario)
+        mos = analysis.get('margin_of_safety', {}).get(scenario)
+        if isinstance(iv, (int, float)) and isinstance(mos, (int, float)):
+            print(f"{scenario:<18}: IV ${iv:>8.2f} | MOS {mos:>8.2%}")
+        else:
+            iv_text = f"${iv:.2f}" if isinstance(iv, (int, float)) else "N/A"
+            mos_text = f"{mos:.2%}" if isinstance(mos, (int, float)) else "N/A"
+            print(f"{scenario:<18}: IV {iv_text} | MOS {mos_text}")
+
+    reason = analysis.get('error_reason')
     if reason:
         print(f"\n{Colors.YELLOW}Aviso: {reason}{Colors.RESET}")
+
+    # Save the full analysis as TXT in analisis-accion/<TICKER>/<date>.txt
+    save_analysis_txt(analysis)
 
 
 if __name__ == "__main__":
@@ -444,9 +583,9 @@ if __name__ == "__main__":
     total_tickers = len(unique_tickers)
     start_time = time.time()
 
-    print(f"--> Analizando {total_tickers} tickers usando 5 hilos simultáneos...")
+    print(f"--> Analizando {total_tickers} tickers usando 8 hilos simultáneos...")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         # Lanzamos todas las tareas
         future_to_ticker = {executor.submit(analyze_ticker, t): t for t in unique_tickers}
         
@@ -474,19 +613,29 @@ if __name__ == "__main__":
                     debt_to_equity = solvency.get("Debt-to-Equity")
                     op_margin = profitability.get("Operating Margin")
                     roe = profitability.get("ROE")
+                    ebitda_growth = profitability.get("EBITDA Growth (3Y)")
+                    pe_ratio = analysis.get("valuation", {}).get("P/E Ratio")
 
                     # 2. Definimos los "Red Flags" (Banderas Rojas)
                     is_bankrupt_risk = (debt_to_equity is not None and debt_to_equity > 250) # Exceso de deuda
-                    is_losing_money = (op_margin is not None and op_margin < 0.02)          # Margen < 2%
+                    has_good_operating_margin = (op_margin is not None and op_margin >= 0.07) # Margen operativo >= 7%
+                    #has_positive_ebitda_growth = (ebitda_growth is not None and ebitda_growth > 0) # EBITDA Growth > 0
                     is_fake_roe = (roe is not None and roe > 1.0)                          # ROE > 100% suele ser distorsión
+
+                    # Nuevos filtros pedidos
+                    has_pe_under_30 = (pe_ratio is not None and isinstance(pe_ratio, (int, float)) and pe_ratio < 30)
+                    has_debt_ok = (debt_to_equity is not None and isinstance(debt_to_equity, (int, float)) and debt_to_equity < 100)
 
                     # 3. Nueva definición de Gema (MOS > 20%, Moat sólido Y sin señales de quiebra)
                     is_gem = (
                         isinstance(mos_normal, float) and mos_normal > 0.2 and 
                         moat >= 3 and 
                         not is_bankrupt_risk and 
-                        not is_losing_money and 
-                        not is_fake_roe
+                        has_good_operating_margin and 
+                        #has_positive_ebitda_growth and 
+                        not is_fake_roe and
+                        has_pe_under_30 and
+                        has_debt_ok
                     )
 
                     status_color = Colors.GREEN if is_gem else ""
@@ -546,7 +695,12 @@ if __name__ == "__main__":
 
                 f.write("\n--- PROFITABILITY & EFFICIENCY ---\n")
                 for key, value in analysis["profitability"].items():
-                    f.write(f"{key}: {value:.2%}\n" if isinstance(value, (int, float)) else f"{key}: N/A\n")
+                    if key == "EBITDA" and isinstance(value, (int, float)):
+                        f.write(f"{key}: ${value:,.0f}\n")
+                    elif key == "EBITDA Growth (3Y)" and isinstance(value, (int, float)):
+                        f.write(f"{key}: {value:.2%}\n")
+                    else:
+                        f.write(f"{key}: {value:.2%}\n" if isinstance(value, (int, float)) else f"{key}: N/A\n")
 
                 f.write("\n--- CASH FLOW ---\n")
                 for key, value in analysis["cash_flow"].items():
