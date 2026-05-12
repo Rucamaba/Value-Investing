@@ -31,6 +31,60 @@ class Colors:
 import random
 import time
 
+MAX_PERPETUAL_GROWTH_RATE = 0.03
+
+
+def normalize_sector(sector):
+    """Map the raw Yahoo sector into a small set of investing buckets."""
+    if not isinstance(sector, str):
+        return "unknown"
+
+    sector_lower = sector.strip().lower()
+    if not sector_lower:
+        return "unknown"
+    if "technology" in sector_lower:
+        return "technology"
+    if "health" in sector_lower:
+        return "healthcare"
+    if "financial" in sector_lower:
+        return "financials"
+    if "real estate" in sector_lower or "reit" in sector_lower:
+        return "reit"
+    if "utility" in sector_lower:
+        return "utilities"
+    if "consumer staple" in sector_lower or "staple" in sector_lower:
+        return "staples"
+    if "consumer cyclical" in sector_lower:
+        return "consumer_cyclical"
+    if (
+        "energy" in sector_lower
+        or "materials" in sector_lower
+        or "basic materials" in sector_lower
+        or "commodity" in sector_lower
+    ):
+        return "commodities"
+    if "industrial" in sector_lower:
+        return "industrials"
+
+    return "other"
+
+
+def calculate_intrinsic_value_by_multiples(book_value_per_share, target_pb_by_scenario, roe=None):
+    """Fallback valuation for sectors where FCF-based DCF is not reliable."""
+    if not isinstance(book_value_per_share, (int, float)) or book_value_per_share <= 0:
+        return {scenario: "N/A" for scenario in target_pb_by_scenario}
+
+    if isinstance(roe, (int, float)) and roe < 0:
+        target_pb_by_scenario = {
+            scenario: max(target_pb - 0.2, 0.1)
+            for scenario, target_pb in target_pb_by_scenario.items()
+        }
+
+    return {
+        scenario: book_value_per_share * target_pb
+        for scenario, target_pb in target_pb_by_scenario.items()
+    }
+
 def get_financial_data(ticker_symbol):
     """
     Downloads and returns financial data for a given ticker with a retry mechanism.
@@ -79,23 +133,33 @@ def get_financial_data(ticker_symbol):
     print(f"{Colors.RED}Fatal: Could not retrieve data for {ticker_symbol} after multiple attempts.{Colors.RESET}")
     return None
 
-def score_moat(info, financials, cashflow, balance_sheet, total_debt, cash):
+def score_moat(info, financials, cashflow, balance_sheet, total_debt, cash, sector_group=None, roe=None, gross_margin=None):
     """
     Scores the company's competitive moat based on profitability and consistency.
     """
     score = 0
     
-    # 1. High Profitability (ROIC > 15%)
-    try:
-        # NOPAT (EBIT * (1 - Tax Rate)) simplificado
-        ebit = financials.loc['EBIT'].iloc[0]
-        # Capital Invertido = Deuda + Patrimonio - Efectivo
-        cap_inv = total_debt + balance_sheet.loc['Stockholders Equity'].iloc[0] - cash
-        if cap_inv > 0:
-            roic_calc = (ebit * 0.75) / cap_inv # Asumimos 25% de impuestos
-            if roic_calc > 0.15: score += 2
-    except:
-        pass
+    # 1. High Profitability: sector-aware ROIC / ROE
+    if sector_group == "financials":
+        if isinstance(roe, (int, float)) and roe > 0.12:
+            score += 2
+    elif sector_group == "reit":
+        if isinstance(roe, (int, float)) and roe > 0.08:
+            score += 2
+    else:
+        try:
+            # NOPAT (EBIT * (1 - Tax Rate)) simplificado
+            ebit = financials.loc['EBIT'].iloc[0]
+            # Capital Invertido = Deuda + Patrimonio - Efectivo
+            cap_inv = total_debt + balance_sheet.loc['Stockholders Equity'].iloc[0] - cash
+            if cap_inv > 0:
+                roic_calc = (ebit * 0.75) / cap_inv # Asumimos 25% de impuestos
+                if roic_calc > 0.15: score += 2
+        except:
+            pass
+
+    if sector_group == "technology" and isinstance(gross_margin, (int, float)) and gross_margin > 0.50:
+        score += 1
         
     # 2. Margin Stability (Stable/Growing Operating Margin over 3 years)
     try:
@@ -136,14 +200,24 @@ def score_moat(info, financials, cashflow, balance_sheet, total_debt, cash):
     return score
 
 def calculate_intrinsic_value(fcf_current, g_ultra_pessimistic, g_pessimistic, g_normal, g_optimistic, g_ultra_optimistic,
-                              shares_outstanding, cash, total_debt, current_price):
+                              shares_outstanding, cash, total_debt, current_price, sector_group=None, discount_rate_normal=None):
     """
     Calculates the intrinsic value using a DCF model for pessimistic, normal, and optimistic scenarios.
     """
+    perpetual_growth_rate = min(PERPETUAL_GROWTH_RATE, MAX_PERPETUAL_GROWTH_RATE)
+
+    if discount_rate_normal is None:
+        if sector_group in {"utilities", "staples"}:
+            discount_rate_normal = 0.08
+        elif sector_group in {"technology", "commodities"}:
+            discount_rate_normal = 0.12
+        else:
+            discount_rate_normal = DISCOUNT_RATE_NORMAL
+
     scenarios = {
         "Ultra Pessimistic": {"g": g_ultra_pessimistic, "r": DISCOUNT_RATE_ULTRA_PESSIMISTIC},
         "Pessimistic": {"g": g_pessimistic, "r": DISCOUNT_RATE_PESSIMISTIC},
-        "Normal": {"g": g_normal, "r": DISCOUNT_RATE_NORMAL},
+        "Normal": {"g": g_normal, "r": discount_rate_normal},
         "Optimistic": {"g": g_optimistic, "r": DISCOUNT_RATE_OPTIMISTIC},
         "Ultra Optimistic": {"g": g_ultra_optimistic, "r": DISCOUNT_RATE_ULTRA_OPTIMISTIC},
     }
@@ -154,9 +228,12 @@ def calculate_intrinsic_value(fcf_current, g_ultra_pessimistic, g_pessimistic, g
         g = params["g"]
         r = params["r"]
 
-        if r <= PERPETUAL_GROWTH_RATE:
+        if r <= perpetual_growth_rate:
             results[scenario_name] = "Invalid Discount Rate"
             continue
+
+        if (r - perpetual_growth_rate) < 0.01:
+            r = perpetual_growth_rate + 0.015
 
         fcf_projections = []
         last_fcf = fcf_current
@@ -168,7 +245,7 @@ def calculate_intrinsic_value(fcf_current, g_ultra_pessimistic, g_pessimistic, g
         dcf = [fcf / ((1 + r) ** (i + 1)) for i, fcf in enumerate(fcf_projections)]
         
         fcf_year_10 = fcf_projections[-1]
-        terminal_value = fcf_year_10 * (1 + PERPETUAL_GROWTH_RATE) / (r - PERPETUAL_GROWTH_RATE)
+        terminal_value = fcf_year_10 * (1 + perpetual_growth_rate) / (r - perpetual_growth_rate)
         discounted_terminal_value = terminal_value / ((1 + r) ** 10)
         
         enterprise_value = sum(dcf) + discounted_terminal_value
@@ -197,6 +274,8 @@ def analyze_ticker(ticker_symbol):
     financials = data["financials"]
     balance_sheet = data["balance_sheet"]
     cashflow = data["cashflow"]
+    sector = info.get("sector")
+    sector_group = normalize_sector(sector)
 
     # --- Ratios de Valoración ---
     pe_ratio = info.get("trailingPE")
@@ -242,9 +321,19 @@ def analyze_ticker(ticker_symbol):
         equity = balance_sheet.loc['Stockholders Equity'].iloc[0]
         # Usamos las variables 'total_debt' y 'cash' que ya calculaste arriba
         invested_capital = total_debt + equity - cash
-        roic = (ebit * 0.75) / invested_capital if invested_capital > 0 else None
+        if invested_capital is None or invested_capital <= 0:
+            roic = None
+        else:
+            roic = (ebit * 0.75) / invested_capital
     except:
         roic = info.get("returnOnInvestedCapital") # Fallback al dato de Yahoo
+
+    try:
+        ebit = financials.loc['EBIT'].iloc[0]
+        interest_expense = abs(financials.loc['Interest Expense'].iloc[0])
+        interest_coverage = ebit / interest_expense if interest_expense > 0 else None
+    except:
+        interest_coverage = info.get("interestCoverage")
 
     # EBITDA: EBIT + Depreciation & Amortization
     try:
@@ -318,32 +407,75 @@ def analyze_ticker(ticker_symbol):
     
     shares_outstanding = info.get("impliedSharesOutstanding") or info.get("sharesOutstanding")
     current_price = info.get("currentPrice")
+    book_value_per_share = info.get("bookValue")
+
+    if not isinstance(book_value_per_share, (int, float)) or book_value_per_share <= 0:
+        try:
+            equity = balance_sheet.loc['Stockholders Equity'].iloc[0]
+            if shares_outstanding and shares_outstanding > 0:
+                book_value_per_share = equity / shares_outstanding
+        except:
+            if isinstance(current_price, (int, float)) and isinstance(pb_ratio, (int, float)) and pb_ratio > 0:
+                book_value_per_share = current_price / pb_ratio
 
     # --- Cálculo del Valor Intrínseco ---
     error_reason = None
-    if fcf is None or fcf <= 0:
-        error_reason = "Negative/Zero FCF"
-    elif not shares_outstanding:
-        error_reason = "No Shares Data"
-    
-    if error_reason:
-        intrinsic_values = {sc: "N/A" for sc in ["Ultra Pessimistic", "Pessimistic", "Normal", "Optimistic", "Ultra Optimistic"]}
+    if sector_group in {"financials", "reit"}:
+        valuation_model = "Multiples"
+        if sector_group == "financials":
+            target_pb_by_scenario = {
+                "Ultra Pessimistic": 0.90,
+                "Pessimistic": 1.00,
+                "Normal": 1.20,
+                "Optimistic": 1.35,
+                "Ultra Optimistic": 1.50,
+            }
+        else:
+            target_pb_by_scenario = {
+                "Ultra Pessimistic": 0.80,
+                "Pessimistic": 0.90,
+                "Normal": 1.05,
+                "Optimistic": 1.15,
+                "Ultra Optimistic": 1.25,
+            }
+
+        if isinstance(dividend_yield, (int, float)) and dividend_yield >= 0.04:
+            target_pb_by_scenario = {scenario: target_pb + 0.05 for scenario, target_pb in target_pb_by_scenario.items()}
+
+        if isinstance(roe, (int, float)) and roe < 0:
+            target_pb_by_scenario = {scenario: target_pb - 0.2 for scenario, target_pb in target_pb_by_scenario.items()}
+        elif isinstance(roe, (int, float)) and roe >= 0.10:
+            target_pb_by_scenario = {scenario: target_pb + 0.05 for scenario, target_pb in target_pb_by_scenario.items()}
+
+        intrinsic_values = calculate_intrinsic_value_by_multiples(book_value_per_share, target_pb_by_scenario, roe=roe)
+        if all(value == "N/A" for value in intrinsic_values.values()):
+            error_reason = "No Book Value Data"
     else:
-        intrinsic_values = calculate_intrinsic_value(
-            fcf_current=float(fcf),
-            g_ultra_pessimistic=g_ultra_pessimistic,
-            g_pessimistic=g_pessimistic, 
-            g_normal=g_normal, 
-            g_optimistic=g_optimistic,
-            g_ultra_optimistic=g_ultra_optimistic,
-            shares_outstanding=float(shares_outstanding),
-            cash=float(cash),
-            total_debt=float(total_debt),
-            current_price=current_price
-        )
-        # Si la función devuelve un string (como "Check Data"), lo capturamos
-        if isinstance(intrinsic_values.get("Normal"), str):
-            error_reason = intrinsic_values.get("Normal")
+        valuation_model = "DCF"
+        if fcf is None or fcf <= 0:
+            error_reason = "Negative/Zero FCF"
+        elif not shares_outstanding:
+            error_reason = "No Shares Data"
+
+        if error_reason:
+            intrinsic_values = {sc: "N/A" for sc in ["Ultra Pessimistic", "Pessimistic", "Normal", "Optimistic", "Ultra Optimistic"]}
+        else:
+            intrinsic_values = calculate_intrinsic_value(
+                fcf_current=float(fcf),
+                g_ultra_pessimistic=g_ultra_pessimistic,
+                g_pessimistic=g_pessimistic, 
+                g_normal=g_normal, 
+                g_optimistic=g_optimistic,
+                g_ultra_optimistic=g_ultra_optimistic,
+                shares_outstanding=float(shares_outstanding),
+                cash=float(cash),
+                total_debt=float(total_debt),
+                current_price=current_price,
+                sector_group=sector_group
+            )
+            # Si la función devuelve un string (como "Check Data"), lo capturamos
+            if isinstance(intrinsic_values.get("Normal"), str):
+                error_reason = intrinsic_values.get("Normal")
     
     margin_of_safety = {}
     if current_price:
@@ -354,12 +486,15 @@ def analyze_ticker(ticker_symbol):
                 margin_of_safety[scenario] = None
     
     # Moat score usando los nuevos datos de cash y total_debt
-    moat_score = score_moat(info, financials, cashflow, balance_sheet, total_debt, cash)
+    moat_score = score_moat(info, financials, cashflow, balance_sheet, total_debt, cash, sector_group=sector_group, roe=roe, gross_margin=gross_margin)
 
     return {
         "ticker": ticker_symbol,
         "price": current_price,
         "error_reason": error_reason,
+        "sector": sector,
+        "sector_group": sector_group,
+        "valuation_model": valuation_model,
         "moat_score": moat_score,
         "valuation": {
             "P/E Ratio": pe_ratio,
@@ -369,6 +504,7 @@ def analyze_ticker(ticker_symbol):
         "solvency": {
             "Debt-to-Equity": debt_to_equity,
             "Current Ratio": current_ratio,
+            "Interest Coverage": interest_coverage,
             "Net Debt": total_debt - cash,
         },
         "profitability": {
@@ -382,6 +518,9 @@ def analyze_ticker(ticker_symbol):
         "cash_flow": {
             "Free Cash Flow (3Y Avg)": fcf,
             "Dividend Yield": dividend_yield,
+        },
+        "market_data": {
+            "Fifty Two Week High": info.get("fiftyTwoWeekHigh"),
         },
         "intrinsic_value": intrinsic_values,
         "margin_of_safety": margin_of_safety,
@@ -400,11 +539,21 @@ def save_analysis_txt(analysis):
         file_path = os.path.join(base_dir, datetime.now().strftime("%Y-%m-%d") + ".txt")
 
         lines = []
+        reason = analysis.get('error_reason')
+        if reason:
+            lines.append("!" * 80)
+            lines.append("!" + " " * 78 + "!")
+            lines.append(f"!  ADVERTENCIA: {reason[:68]:<68}  !")
+            lines.append("!" + " " * 78 + "!")
+            lines.append("!  La valoración para este ticker puede ser poco fiable.            !")
+            lines.append("!" * 80)
+            lines.append("")
         lines.append("=" * 80)
         lines.append(f"ANALISIS DE {analysis.get('company_name', ticker)} - {ticker}")
         lines.append("=" * 80)
         lines.append(f"Precio actual: ${analysis.get('price'):.2f}" if isinstance(analysis.get('price'), (int, float)) else "Precio actual: N/A")
         lines.append(f"MOAT Score: {analysis.get('moat_score', 'N/A')}/7")
+        lines.append(f"Sector: {analysis.get('sector') or analysis.get('sector_group') or 'N/A'}")
         lines.append("")
 
         lines.append("--- VALUATION ---")
@@ -452,7 +601,6 @@ def save_analysis_txt(analysis):
                 mos_text = f"{mos:.2%}" if isinstance(mos, (int, float)) else "N/A"
                 lines.append(f"{scenario:<18}: IV {iv_text} | MOS {mos_text}")
 
-        reason = analysis.get('error_reason')
         if reason:
             lines.append("")
             lines.append(f"Aviso: {reason}")
@@ -610,11 +758,20 @@ if __name__ == "__main__":
                     # 1. Recuperamos métricas clave
                     solvency = analysis.get("solvency", {})
                     profitability = analysis.get("profitability", {})
+                    cash_flow = analysis.get("cash_flow", {})
+                    market_data = analysis.get("market_data", {})
+                    sector_group = analysis.get("sector_group") or normalize_sector(analysis.get("sector"))
                     debt_to_equity = solvency.get("Debt-to-Equity")
+                    interest_coverage = solvency.get("Interest Coverage")
                     op_margin = profitability.get("Operating Margin")
+                    gross_margin = profitability.get("Gross Margin")
                     roe = profitability.get("ROE")
+                    roic = profitability.get("ROIC")
                     ebitda_growth = profitability.get("EBITDA Growth (3Y)")
                     pe_ratio = analysis.get("valuation", {}).get("P/E Ratio")
+                    pb_ratio = analysis.get("valuation", {}).get("P/BV Ratio")
+                    ev_to_ebitda = analysis.get("valuation", {}).get("EV/EBITDA")
+                    dividend_yield = cash_flow.get("Dividend Yield")
 
                     # 2. Definimos los "Red Flags" (Banderas Rojas)
                     is_bankrupt_risk = (debt_to_equity is not None and debt_to_equity > 250) # Exceso de deuda
@@ -622,21 +779,102 @@ if __name__ == "__main__":
                     #has_positive_ebitda_growth = (ebitda_growth is not None and ebitda_growth > 0) # EBITDA Growth > 0
                     is_fake_roe = (roe is not None and roe > 1.0)                          # ROE > 100% suele ser distorsión
 
-                    # Nuevos filtros pedidos
-                    has_pe_under_30 = (pe_ratio is not None and isinstance(pe_ratio, (int, float)) and pe_ratio < 30)
-                    has_debt_ok = (debt_to_equity is not None and isinstance(debt_to_equity, (int, float)) and debt_to_equity < 100)
+                    has_pe_under_40 = (pe_ratio is not None and isinstance(pe_ratio, (int, float)) and pe_ratio <= 40)
+                    has_pb_under_12 = (pb_ratio is not None and isinstance(pb_ratio, (int, float)) and pb_ratio < 1.2)
+                    has_pb_under_15 = (pb_ratio is not None and isinstance(pb_ratio, (int, float)) and pb_ratio < 1.5)
+                    has_dividend_over_4 = (dividend_yield is not None and isinstance(dividend_yield, (int, float)) and dividend_yield >= 0.04)
+                    has_debt_ok_150 = (debt_to_equity is not None and isinstance(debt_to_equity, (int, float)) and debt_to_equity <= 150)
+                    has_debt_ok_60 = (debt_to_equity is not None and isinstance(debt_to_equity, (int, float)) and debt_to_equity < 60)
+                    has_interest_coverage = (interest_coverage is not None and isinstance(interest_coverage, (int, float)) and interest_coverage > 4)
+                    has_ev_ebitda_under_8 = (ev_to_ebitda is not None and isinstance(ev_to_ebitda, (int, float)) and ev_to_ebitda < 8)
+                    mos_good_default = isinstance(mos_normal, (float, int)) and mos_normal > 0.2
+                    mos_good_looser = isinstance(mos_normal, (float, int)) and mos_normal > 0.15
 
-                    # 3. Nueva definición de Gema (MOS > 20%, Moat sólido Y sin señales de quiebra)
-                    is_gem = (
-                        isinstance(mos_normal, float) and mos_normal > 0.2 and 
-                        moat >= 3 and 
-                        not is_bankrupt_risk and 
-                        has_good_operating_margin and 
-                        #has_positive_ebitda_growth and 
-                        not is_fake_roe and
-                        has_pe_under_30 and
-                        has_debt_ok
-                    )
+                    if sector_group == "technology":
+                        is_gem = (
+                            mos_good_default and
+                            moat >= 3 and
+                            not is_fake_roe and
+                            not is_bankrupt_risk and
+                            op_margin is not None and op_margin > 0.15 and
+                            ebitda_growth is not None and ebitda_growth > 0.10 and
+                            has_pe_under_40
+                        )
+                    elif sector_group == "healthcare":
+                        is_gem = (
+                            mos_good_default and
+                            moat >= 3 and
+                            not is_fake_roe and
+                            gross_margin is not None and gross_margin > 0.60 and
+                            roic is not None and roic > 0.15
+                        )
+                    elif sector_group == "financials":
+                        is_gem = (
+                            mos_good_looser and
+                            moat >= 3 and
+                            not is_fake_roe and
+                            has_pb_under_12 and
+                            roe is not None and roe > 0.10
+                        )
+                    elif sector_group == "commodities":
+                        fifty_two_week_high = market_data.get("Fifty Two Week High")
+                        is_gem = (
+                            mos_good_default and
+                            moat >= 3 and
+                            not is_fake_roe and
+                            has_debt_ok_60 and
+                            has_ev_ebitda_under_8 and
+                            analysis.get("price") is not None and
+                            fifty_two_week_high is not None and
+                            analysis.get("price") < 0.8 * fifty_two_week_high
+                        )
+                    elif sector_group in {"utilities", "industrials"}:
+                        is_gem = (
+                            mos_good_looser and
+                            moat >= 3 and
+                            not is_fake_roe and
+                            has_debt_ok_150 and
+                            has_interest_coverage and
+                            op_margin is not None and op_margin >= 0.07
+                        )
+                    elif sector_group == "reit":
+                        is_gem = (
+                            mos_good_looser and
+                            moat >= 3 and
+                            not is_fake_roe and
+                            has_pb_under_15 and
+                            has_dividend_over_4
+                        )
+                    elif sector_group == "staples":
+                        is_gem = (
+                            mos_good_default and
+                            moat >= 4 and
+                            not is_fake_roe and
+                            has_good_operating_margin and
+                            ebitda_growth is not None and ebitda_growth >= 0.04 and
+                            not is_bankrupt_risk
+                        )
+                    elif sector_group == "consumer_cyclical":
+                        is_gem = (
+                            mos_good_default and
+                            moat >= 3 and
+                            not is_bankrupt_risk and
+                            has_good_operating_margin and
+                            not is_fake_roe and
+                            pe_ratio is not None and isinstance(pe_ratio, (int, float)) and pe_ratio < 30 and
+                            debt_to_equity is not None and isinstance(debt_to_equity, (int, float)) and debt_to_equity < 100
+                        )
+                    else:
+                        is_gem = (
+                            mos_good_default and 
+                            moat >= 3 and 
+                            not is_bankrupt_risk and 
+                            has_good_operating_margin and 
+                            #has_positive_ebitda_growth and 
+                            not is_fake_roe and
+                            pe_ratio is not None and isinstance(pe_ratio, (int, float)) and pe_ratio < 30 and
+                            debt_to_equity is not None and isinstance(debt_to_equity, (int, float)) and debt_to_equity < 100
+                        )
 
                     status_color = Colors.GREEN if is_gem else ""
                     
@@ -681,6 +919,7 @@ if __name__ == "__main__":
                 f.write(f"{'#'*60}\n")
                 f.write(f"Current Price: ${analysis['price']:.2f}\n")
                 f.write(f"MOAT Score: {analysis['moat_score']}/7\n")
+                f.write(f"Sector: {analysis.get('sector') or analysis.get('sector_group') or 'N/A'}\n")
 
                 f.write("\n--- VALUATION ---\n")
                 for key, value in analysis["valuation"].items():
