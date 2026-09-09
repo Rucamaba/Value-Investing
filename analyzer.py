@@ -8,6 +8,15 @@ import os
 import numpy as np
 import argparse
 from markets import get_tickers_from_csv
+from peers import (
+    build_industry_benchmarks,
+    compare_to_peers,
+    extract_peer_metrics_with_balance,
+    format_peer_section,
+    load_benchmarks,
+    passes_peer_robustness,
+    save_benchmarks,
+)
 import time
 from datetime import datetime
 import concurrent.futures
@@ -27,9 +36,6 @@ class Colors:
     YELLOW = '\033[93m'
     RED = '\033[91m'
     RESET = '\033[0m'
-
-import random
-import time
 
 def get_financial_data(ticker_symbol):
     """
@@ -331,6 +337,17 @@ def analyze_ticker(ticker_symbol):
     # Moat score usando los nuevos datos de cash y total_debt
     moat_score = score_moat(info, financials, cashflow, balance_sheet, total_debt, cash)
 
+    peer_metrics = extract_peer_metrics_with_balance(
+        info=info,
+        financials=financials,
+        balance_sheet=balance_sheet,
+        cashflow=cashflow,
+        fcf=fcf,
+        debt_to_equity=debt_to_equity,
+        operating_margin=operating_margin,
+        roe=roe,
+    )
+
     return {
         "ticker": ticker_symbol,
         "price": current_price,
@@ -340,6 +357,7 @@ def analyze_ticker(ticker_symbol):
             "P/E Ratio": pe_ratio,
             "P/BV Ratio": pb_ratio,
             "EV/EBITDA": ev_to_ebitda,
+            "Price/FCF": peer_metrics.get("Price/FCF"),
         },
         "solvency": {
             "Debt-to-Equity": debt_to_equity,
@@ -348,18 +366,53 @@ def analyze_ticker(ticker_symbol):
         },
         "profitability": {
             "ROE": roe,
+            "ROE (multi-year avg)": peer_metrics.get("ROE (multi-year avg)"),
             "ROIC": roic,
             "Gross Margin": gross_margin,
             "Operating Margin": operating_margin,
+            "Operating Margin (multi-year avg)": peer_metrics.get("Operating Margin (multi-year avg)"),
         },
         "cash_flow": {
             "Free Cash Flow (3Y Avg)": fcf,
             "Dividend Yield": dividend_yield,
         },
+        "peer_metrics": peer_metrics,
+        "peers": None,  # filled after industry benchmarks are available
         "intrinsic_value": intrinsic_values,
         "margin_of_safety": margin_of_safety,
         "company_name": info.get("longName"),
+        "industry": peer_metrics.get("industry"),
+        "sector": peer_metrics.get("sector"),
     }
+
+
+def is_quality_gem(analysis: dict) -> bool:
+    """
+    Core gem definition: MOS + moat + red-flag filters + peer robustness.
+    Peer data only blocks clear relative traps (worse vs industry on all checks).
+    """
+    mos_normal = analysis.get("margin_of_safety", {}).get("Normal")
+    moat = analysis.get("moat_score")
+    solvency = analysis.get("solvency", {})
+    profitability = analysis.get("profitability", {})
+    debt_to_equity = solvency.get("Debt-to-Equity")
+    op_margin = profitability.get("Operating Margin")
+    roe = profitability.get("ROE")
+
+    is_bankrupt_risk = debt_to_equity is not None and debt_to_equity > 250
+    is_losing_money = op_margin is not None and op_margin < 0.02
+    is_fake_roe = roe is not None and roe > 1.0
+
+    return (
+        isinstance(mos_normal, float)
+        and mos_normal > 0.2
+        and moat is not None
+        and moat >= 3
+        and not is_bankrupt_risk
+        and not is_losing_money
+        and not is_fake_roe
+        and passes_peer_robustness(analysis.get("peers"))
+    )
 
 
 def print_single_ticker_report(analysis):
@@ -381,6 +434,8 @@ def print_single_ticker_report(analysis):
         print("Precio actual: N/A")
 
     print(f"MOAT Score: {analysis.get('moat_score', 'N/A')}/7")
+    if analysis.get("industry"):
+        print(f"Industry: {analysis.get('industry')} | Sector: {analysis.get('sector', 'N/A')}")
 
     print("\n--- VALOR INTRINSECO Y MARGEN DE SEGURIDAD ---")
     for scenario in ["Ultra Pessimistic", "Pessimistic", "Normal", "Optimistic", "Ultra Optimistic"]:
@@ -390,9 +445,22 @@ def print_single_ticker_report(analysis):
         mos_text = f"{mos:.2%}" if isinstance(mos, (int, float)) else "N/A"
         print(f"{scenario:<18}: IV {iv_text:>12} | MOS {mos_text:>8}")
 
+    print("\n--- PEERS / INDUSTRIA ---")
+    for line in format_peer_section(analysis.get("peers")):
+        print(line)
+
+    p_fcf = (analysis.get("valuation") or {}).get("Price/FCF")
+    if isinstance(p_fcf, (int, float)):
+        print(f"Price/FCF (company): {p_fcf:.1f}x")
+
     reason = analysis.get("error_reason")
     if reason:
         print(f"\n{Colors.YELLOW}Aviso: {reason}{Colors.RESET}")
+
+    if is_quality_gem(analysis):
+        print(f"\n{Colors.GREEN}>>> Cumple criterios de GEMA (MOS + moat + peers).{Colors.RESET}")
+    elif analysis.get("peers", {}).get("is_relative_trap"):
+        print(f"\n{Colors.YELLOW}>>> Descarta por trampa relativa vs industria.{Colors.RESET}")
 
 
 if __name__ == "__main__":
@@ -417,6 +485,17 @@ if __name__ == "__main__":
         ticker = args.ticker.strip().upper()
         print(f"--> Analizando ticker individual: {ticker}")
         single_result = analyze_ticker(ticker)
+        if single_result:
+            benchmarks = load_benchmarks()
+            if benchmarks:
+                single_result["peers"] = compare_to_peers(single_result, benchmarks)
+                print("--> Benchmarks de industria cargados desde data/industry_benchmarks.json")
+            else:
+                single_result["peers"] = compare_to_peers(single_result, None)
+                print(
+                    f"{Colors.YELLOW}--> Sin benchmarks locales. Ejecuta un scan completo "
+                    f"para habilitar peers vs industria.{Colors.RESET}"
+                )
         print_single_ticker_report(single_result)
 
         end_time = time.time()
@@ -436,73 +515,77 @@ if __name__ == "__main__":
     unique_tickers = sorted(list(set(all_tickers)))
     print(f"--> Analyzing {len(unique_tickers)} unique tickers.")
     
-    # Lista para almacenar las "joyas" encontradas
-    undervalued_opportunities = []
-
-    # --- INICIO DEL ANÁLISIS EN PARALELO ---
-    undervalued_opportunities = []
+    # --- INICIO DEL ANÁLISIS EN PARALELO (pasada 1: datos + DCF/moat) ---
+    all_analyses = []
     total_tickers = len(unique_tickers)
     start_time = time.time()
 
     print(f"--> Analizando {total_tickers} tickers usando 5 hilos simultáneos...")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        # Lanzamos todas las tareas
         future_to_ticker = {executor.submit(analyze_ticker, t): t for t in unique_tickers}
         
-        # Procesamos los resultados conforme van terminando
         for i, future in enumerate(concurrent.futures.as_completed(future_to_ticker), 1):
             ticker = future_to_ticker[future]
             try:
                 analysis = future.result()
                 if analysis:
-                    # --- MONITORIZACIÓN POR TERMINAL CORREGIDA ---
+                    all_analyses.append(analysis)
                     mos_normal = analysis['margin_of_safety'].get("Normal")
                     moat = analysis['moat_score']
                     reason = analysis.get("error_reason")
+                    industry = analysis.get("industry") or "?"
                     
-                    # Preparamos el texto del margen para evitar el error de formato
                     if isinstance(mos_normal, (float, int)):
                         mos_str = f"{mos_normal:.2%}"
                     else:
                         mos_str = f"{Colors.YELLOW}{reason if reason else 'N/A'}{Colors.RESET}"
                     
-                    # --- FILTROS DE CALIDAD Y SEGURIDAD (Criterios de Inversión Real) ---
-                    # 1. Recuperamos métricas clave
-                    solvency = analysis.get("solvency", {})
-                    profitability = analysis.get("profitability", {})
-                    debt_to_equity = solvency.get("Debt-to-Equity")
-                    op_margin = profitability.get("Operating Margin")
-                    roe = profitability.get("ROE")
-
-                    # 2. Definimos los "Red Flags" (Banderas Rojas)
-                    is_bankrupt_risk = (debt_to_equity is not None and debt_to_equity > 250) # Exceso de deuda
-                    is_losing_money = (op_margin is not None and op_margin < 0.02)          # Margen < 2%
-                    is_fake_roe = (roe is not None and roe > 1.0)                          # ROE > 100% suele ser distorsión
-
-                    # 3. Nueva definición de Gema (MOS > 20%, Moat sólido Y sin señales de quiebra)
-                    is_gem = (
-                        isinstance(mos_normal, float) and mos_normal > 0.2 and 
-                        moat >= 3 and 
-                        not is_bankrupt_risk and 
-                        not is_losing_money and 
-                        not is_fake_roe
+                    print(
+                        f"[{i}/{total_tickers}] Analyzed: {ticker:<8} | Moat: {moat} | "
+                        f"MOS: {mos_str} | {industry}"
                     )
-
-                    status_color = Colors.GREEN if is_gem else ""
-                    
-                    print(f"[{i}/{total_tickers}] {status_color}Analyzed: {ticker:<8} | Moat: {moat} | MOS: {mos_str}{Colors.RESET}")
-
-                    # --- FILTRADO PARA GUARDAR ---
-                    if is_gem:
-                        undervalued_opportunities.append(analysis)
             except Exception as e:
                 print(f"{Colors.RED}Error con {ticker}: {e}{Colors.RESET}")
 
+    # --- PASADA 2: benchmarks de industria + filtro de gemas con peers ---
+    print(f"\n--> Construyendo benchmarks de industria a partir de {len(all_analyses)} análisis...")
+    benchmarks = build_industry_benchmarks(all_analyses)
+    save_benchmarks(benchmarks)
+    usable_industries = sum(
+        1
+        for ind in benchmarks.get("industries", {}).values()
+        if (ind.get("sample_size") or 0) >= benchmarks.get("peer_min_sample", 5)
+    )
+    print(
+        f"--> {len(benchmarks.get('industries', {}))} industrias "
+        f"({usable_industries} con muestra suficiente). Guardado en data/industry_benchmarks.json"
+    )
+
+    undervalued_opportunities = []
+    relative_traps = 0
+    for analysis in all_analyses:
+        analysis["peers"] = compare_to_peers(analysis, benchmarks)
+        if analysis["peers"].get("is_relative_trap"):
+            relative_traps += 1
+        if is_quality_gem(analysis):
+            undervalued_opportunities.append(analysis)
+
+    print(
+        f"--> Peer filter: {relative_traps} trampas relativas detectadas; "
+        f"{len(undervalued_opportunities)} gemas tras peers."
+    )
+
     # --- GENERACIÓN DEL ARCHIVO FINAL ---
     if undervalued_opportunities:
-        # Ordenamos por mayor Margen de Seguridad
-        undervalued_opportunities.sort(key=lambda x: x['margin_of_safety']['Normal'], reverse=True)
+        # Mejor margen de seguridad primero; a igualdad, más ventaja vs peers
+        undervalued_opportunities.sort(
+            key=lambda x: (
+                x["margin_of_safety"]["Normal"],
+                (x.get("peers") or {}).get("edge_score") or 0,
+            ),
+            reverse=True,
+        )
         
         output_dir = ".\\infravaloradas"
         os.makedirs(output_dir, exist_ok=True)
@@ -510,18 +593,28 @@ if __name__ == "__main__":
         output_file = os.path.join(output_dir, f"infravaloradas_{today_str}.txt")
         
         with open(output_file, "w", encoding="utf-8") as f:
-            # PARTE 1: TABLA RESUMEN (Vista rápida)
             f.write("=================================================================================\n")
             f.write(f"RESUMEN DE ACCIONES INFRAVALORADAS - {today_str}\n")
+            f.write("Filtro: MOS>20% + Moat>=3 + red flags + peers (sin trampa relativa vs industria)\n")
             f.write("=================================================================================\n")
-            f.write(f"{'Ticker':<10} | {'Precio':<10} | {'V.I. Normal':<12} | {'Margen (MOS)':<12} | {'MOAT'}\n")
-            f.write("-" * 81 + "\n")
+            f.write(
+                f"{'Ticker':<10} | {'Precio':<10} | {'V.I. Normal':<12} | {'Margen (MOS)':<12} | "
+                f"{'MOAT':<6} | {'Peer':<8} | Industry\n"
+            )
+            f.write("-" * 110 + "\n")
             for op in undervalued_opportunities:
-                f.write(f"{op['ticker']:<10} | ${op['price']:<9.2f} | ${op['intrinsic_value']['Normal']:<11.2f} | {op['margin_of_safety']['Normal']:<12.2%} | {op['moat_score']}/7\n")
+                peers = op.get("peers") or {}
+                edge = f"{peers.get('edge_score', 0)}/{peers.get('max_edges', 0)}"
+                industry = (peers.get("industry") or op.get("industry") or "")[:28]
+                f.write(
+                    f"{op['ticker']:<10} | ${op['price']:<9.2f} | "
+                    f"${op['intrinsic_value']['Normal']:<11.2f} | "
+                    f"{op['margin_of_safety']['Normal']:<12.2%} | "
+                    f"{op['moat_score']}/7   | {edge:<8} | {industry}\n"
+                )
             
             f.write("\n\n")
 
-            # PARTE 2: ANÁLISIS DETALLADO (Copia de la terminal por cada empresa)
             f.write("=================================================================================\n")
             f.write("DETALLE EXTENDIDO DE CADA OPORTUNIDAD\n")
             f.write("=================================================================================\n")
@@ -532,10 +625,17 @@ if __name__ == "__main__":
                 f.write(f"{'#'*60}\n")
                 f.write(f"Current Price: ${analysis['price']:.2f}\n")
                 f.write(f"MOAT Score: {analysis['moat_score']}/7\n")
+                f.write(f"Industry: {analysis.get('industry', 'N/A')} | Sector: {analysis.get('sector', 'N/A')}\n")
 
                 f.write("\n--- VALUATION ---\n")
                 for key, value in analysis["valuation"].items():
-                    f.write(f"{key}: {value:.2f}\n" if isinstance(value, (int, float)) else f"{key}: N/A\n")
+                    if isinstance(value, (int, float)):
+                        if "Price/FCF" in key:
+                            f.write(f"{key}: {value:.1f}x\n")
+                        else:
+                            f.write(f"{key}: {value:.2f}\n")
+                    else:
+                        f.write(f"{key}: N/A\n")
                 
                 f.write("\n--- SOLVENCY & HEALTH ---\n")
                 for key, value in analysis["solvency"].items():
@@ -558,15 +658,17 @@ if __name__ == "__main__":
                     else:
                         f.write(f"{key}: N/A\n")
 
+                f.write("\n--- PEERS / INDUSTRIA ---\n")
+                for line in format_peer_section(analysis.get("peers")):
+                    f.write(line + "\n")
+
                 f.write("\n--- INTRINSIC VALUE & MARGIN OF SAFETY ---\n")
                 for scenario in ["Ultra Pessimistic", "Pessimistic", "Normal", "Optimistic", "Ultra Optimistic"]:
                     iv = analysis['intrinsic_value'].get(scenario)
                     mos = analysis['margin_of_safety'].get(scenario)
-                    # Verifica que AMBOS sean números (int o float) y no None
                     if isinstance(iv, (int, float)) and isinstance(mos, (int, float)):
                         f.write(f"{scenario:<18}: IV ${iv:>8.2f} | MOS {mos:>8.2%}\n")
                     else:
-                        # Si alguno es None o un mensaje de error, escribe el texto tal cual
                         iv_text = f"${iv:.2f}" if isinstance(iv, (int, float)) else "N/A"
                         mos_text = f"{mos:.2%}" if isinstance(mos, (int, float)) else "N/A"
                         f.write(f"{scenario:<18}: IV {iv_text} | MOS {mos_text}\n")
