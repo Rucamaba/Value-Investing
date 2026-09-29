@@ -415,9 +415,114 @@ def is_quality_gem(analysis: dict) -> bool:
     )
 
 
+def save_analysis_txt(analysis):
+    """
+    Saves the full analysis as a human-readable .txt under
+    analisis-accion/<TICKER>/<YYYY-MM-DD>.txt
+    """
+    try:
+        ticker = analysis.get("ticker")
+        base_dir = os.path.join(os.getcwd(), "analisis-accion", ticker)
+        os.makedirs(base_dir, exist_ok=True)
+        file_path = os.path.join(base_dir, datetime.now().strftime("%Y-%m-%d") + ".txt")
+
+        lines = []
+        lines.append("=" * 80)
+        lines.append(f"ANALISIS DE {analysis.get('company_name', ticker)} - {ticker}")
+        lines.append("=" * 80)
+        if isinstance(analysis.get("price"), (int, float)):
+            lines.append(f"Precio actual: ${analysis['price']:.2f}")
+        else:
+            lines.append("Precio actual: N/A")
+        lines.append(f"MOAT Score: {analysis.get('moat_score', 'N/A')}/7")
+        lines.append(
+            f"Industry: {analysis.get('industry', 'N/A')} | Sector: {analysis.get('sector', 'N/A')}"
+        )
+        lines.append("")
+
+        lines.append("--- VALUATION ---")
+        for key, value in (analysis.get("valuation") or {}).items():
+            if isinstance(value, (int, float)):
+                if "Price/FCF" in key:
+                    lines.append(f"{key}: {value:.1f}x")
+                else:
+                    lines.append(f"{key}: {value:.2f}")
+            else:
+                lines.append(f"{key}: N/A")
+
+        lines.append("")
+        lines.append("--- SOLVENCY & HEALTH ---")
+        for key, value in (analysis.get("solvency") or {}).items():
+            if key == "Net Debt" and isinstance(value, (int, float)):
+                lines.append(f"{key}: ${value:,.0f}")
+            else:
+                lines.append(
+                    f"{key}: {value:.2f}" if isinstance(value, (int, float)) else f"{key}: N/A"
+                )
+
+        lines.append("")
+        lines.append("--- PROFITABILITY & EFFICIENCY ---")
+        for key, value in (analysis.get("profitability") or {}).items():
+            lines.append(
+                f"{key}: {value:.2%}" if isinstance(value, (int, float)) else f"{key}: N/A"
+            )
+
+        lines.append("")
+        lines.append("--- CASH FLOW ---")
+        for key, value in (analysis.get("cash_flow") or {}).items():
+            if "Free Cash Flow" in key and isinstance(value, (int, float)):
+                lines.append(f"{key}: ${value:,.0f}")
+            elif "Yield" in key and isinstance(value, (int, float)):
+                val = value / 100 if value > 1 else value
+                lines.append(f"{key}: {val:.2%}")
+            else:
+                lines.append(f"{key}: N/A")
+
+        lines.append("")
+        lines.append("--- PEERS / INDUSTRIA ---")
+        lines.extend(format_peer_section(analysis.get("peers")))
+
+        lines.append("")
+        lines.append("--- INTRINSIC VALUE & MARGIN OF SAFETY ---")
+        for scenario in [
+            "Ultra Pessimistic",
+            "Pessimistic",
+            "Normal",
+            "Optimistic",
+            "Ultra Optimistic",
+        ]:
+            iv = analysis.get("intrinsic_value", {}).get(scenario)
+            mos = analysis.get("margin_of_safety", {}).get(scenario)
+            if isinstance(iv, (int, float)) and isinstance(mos, (int, float)):
+                lines.append(f"{scenario:<18}: IV ${iv:>8.2f} | MOS {mos:>8.2%}")
+            else:
+                iv_text = f"${iv:.2f}" if isinstance(iv, (int, float)) else "N/A"
+                mos_text = f"{mos:.2%}" if isinstance(mos, (int, float)) else "N/A"
+                lines.append(f"{scenario:<18}: IV {iv_text} | MOS {mos_text}")
+
+        reason = analysis.get("error_reason")
+        if reason:
+            lines.append("")
+            lines.append(f"Aviso: {reason}")
+
+        if is_quality_gem(analysis):
+            lines.append("")
+            lines.append(">>> Cumple criterios de GEMA (MOS + moat + peers).")
+        elif (analysis.get("peers") or {}).get("is_relative_trap"):
+            lines.append("")
+            lines.append(">>> Descarta por trampa relativa vs industria.")
+
+        with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+        print(f"{Colors.GREEN}>>> Informe guardado en: {file_path}{Colors.RESET}")
+    except Exception as e:
+        print(f"{Colors.RED}Failed to save analysis TXT: {e}{Colors.RESET}")
+
+
 def print_single_ticker_report(analysis):
     """
-    Prints a detailed report for a single ticker in terminal.
+    Prints a detailed report for a single ticker in terminal and saves it to disk.
     """
     if not analysis:
         print(f"{Colors.RED}No se pudo analizar el ticker solicitado.{Colors.RESET}")
@@ -461,6 +566,8 @@ def print_single_ticker_report(analysis):
         print(f"\n{Colors.GREEN}>>> Cumple criterios de GEMA (MOS + moat + peers).{Colors.RESET}")
     elif analysis.get("peers", {}).get("is_relative_trap"):
         print(f"\n{Colors.YELLOW}>>> Descarta por trampa relativa vs industria.{Colors.RESET}")
+
+    save_analysis_txt(analysis)
 
 
 if __name__ == "__main__":
