@@ -3,6 +3,9 @@ Peer / industry-relative checks for value investing decisions.
 
 Builds industry medians from the scanned universe (no extra API calls on batch
 runs) and compares each company on valuation, leverage and profitability.
+
+For banks / insurers, industrial metrics (Price/FCF, Debt/Equity, operating
+margin) are replaced by P/E, P/B and ROE.
 """
 
 from __future__ import annotations
@@ -17,10 +20,35 @@ PEER_MIN_SAMPLE = 5
 
 # Relative quality thresholds (MarketInOut-style, adapted to our metrics)
 P_FCF_VS_INDUSTRY_MAX = 0.80      # cheaper than industry median
+PE_VS_INDUSTRY_MAX = 0.85
+PB_VS_INDUSTRY_MAX = 0.90
 DEBT_EQUITY_VS_INDUSTRY_MAX = 0.80
 MARGIN_VS_INDUSTRY_MIN = 1.20     # more profitable than industry median
+ROE_VS_INDUSTRY_MIN = 1.10
 
 BENCHMARKS_PATH = os.path.join("data", "industry_benchmarks.json")
+
+FINANCIAL_SECTOR_MARKERS = ("financial",)
+FINANCIAL_INDUSTRY_MARKERS = (
+    "insurance",
+    "bank",
+    "banks",
+    "asset management",
+    "capital market",
+    "credit service",
+    "financial conglomerate",
+    "diversified financial",
+    "mortgage",
+    "savings",
+)
+
+
+def is_financial_firm(sector: str | None, industry: str | None) -> bool:
+    s = (sector or "").strip().lower()
+    i = (industry or "").strip().lower()
+    if any(m in s for m in FINANCIAL_SECTOR_MARKERS):
+        return True
+    return any(m in i for m in FINANCIAL_INDUSTRY_MARKERS)
 
 
 def _safe_div(num: float | None, den: float | None) -> float | None:
@@ -65,43 +93,52 @@ def extract_peer_metrics(
     industry = info.get("industry") or "Unknown"
     sector = info.get("sector") or "Unknown"
     market_cap = info.get("marketCap")
+    financial = is_financial_firm(sector, industry)
 
-    # Price / Free Cash Flow (absolute FCF, 3Y avg when available)
-    price_to_fcf = _safe_div(market_cap, fcf) if fcf and fcf > 0 else None
+    # Price / Free Cash Flow — skip for financials (float distorts FCF)
+    price_to_fcf = None
+    if not financial and fcf and fcf > 0:
+        price_to_fcf = _safe_div(market_cap, fcf)
 
-    # Operating cash flow multiple as fallback valuation check
     ocf = info.get("operatingCashflow")
-    price_to_ocf = _safe_div(market_cap, ocf) if ocf and ocf > 0 else None
+    price_to_ocf = (
+        None if financial else (_safe_div(market_cap, ocf) if ocf and ocf > 0 else None)
+    )
 
+    pe_ratio = info.get("trailingPE")
+    pb_ratio = info.get("priceToBook")
     profit_margin = info.get("profitMargins")
 
     op_margin_avg = None
-    try:
-        if financials is not None and not financials.empty:
-            if "Operating Income" in financials.index and "Total Revenue" in financials.index:
-                op_margin_avg = _series_avg_ratio(
-                    financials.loc["Operating Income"],
-                    financials.loc["Total Revenue"],
-                    max_years=5,
-                )
-    except Exception:
-        op_margin_avg = None
+    if not financial:
+        try:
+            if financials is not None and not financials.empty:
+                if "Operating Income" in financials.index and "Total Revenue" in financials.index:
+                    op_margin_avg = _series_avg_ratio(
+                        financials.loc["Operating Income"],
+                        financials.loc["Total Revenue"],
+                        max_years=5,
+                    )
+        except Exception:
+            op_margin_avg = None
 
-    # Prefer multi-year op margin for peer compare; fall back to TTM
     margin_for_peers = op_margin_avg if op_margin_avg is not None else operating_margin
 
     return {
         "industry": industry,
         "sector": sector,
+        "is_financial": financial,
         "market_cap": market_cap,
         "Price/FCF": price_to_fcf,
         "Price/OCF": price_to_ocf,
-        "Debt-to-Equity": debt_to_equity,
-        "Operating Margin": margin_for_peers,
-        "Profit Margin": profit_margin,
+        "P/E": pe_ratio if isinstance(pe_ratio, (int, float)) and pe_ratio > 0 else None,
+        "P/B": pb_ratio if isinstance(pb_ratio, (int, float)) and pb_ratio > 0 else None,
+        "Debt-to-Equity": None if financial else debt_to_equity,
+        "Operating Margin": None if financial else margin_for_peers,
+        "Profit Margin": None if financial else profit_margin,
         "ROE": roe,
-        "Operating Margin (TTM)": operating_margin,
-        "Operating Margin (multi-year avg)": op_margin_avg,
+        "Operating Margin (TTM)": None if financial else operating_margin,
+        "Operating Margin (multi-year avg)": None if financial else op_margin_avg,
     }
 
 
@@ -149,9 +186,11 @@ def extract_peer_metrics_with_balance(
     except Exception:
         roe_avg = None
 
-    metrics["ROE (multi-year avg)"] = roe_avg
-    if roe_avg is not None:
-        metrics["ROE"] = roe_avg
+    if isinstance(roe_avg, (int, float)) and roe_avg == roe_avg:
+        metrics["ROE (multi-year avg)"] = float(roe_avg)
+        metrics["ROE"] = float(roe_avg)
+    else:
+        metrics["ROE (multi-year avg)"] = None
     return metrics
 
 
@@ -178,6 +217,8 @@ def build_industry_benchmarks(analyses: list[dict]) -> dict[str, Any]:
             industry,
             {
                 "Price/FCF": [],
+                "P/E": [],
+                "P/B": [],
                 "Debt-to-Equity": [],
                 "Operating Margin": [],
                 "Profit Margin": [],
@@ -187,8 +228,7 @@ def build_industry_benchmarks(analyses: list[dict]) -> dict[str, Any]:
         for key in bucket:
             val = peer_m.get(key)
             if isinstance(val, (int, float)) and val == val:
-                # Skip non-sensical negatives for multiples / D/E
-                if key in ("Price/FCF", "Debt-to-Equity") and val <= 0:
+                if key in ("Price/FCF", "Debt-to-Equity", "P/E", "P/B") and val <= 0:
                     continue
                 bucket[key].append(float(val))
 
@@ -200,6 +240,8 @@ def build_industry_benchmarks(analyses: list[dict]) -> dict[str, Any]:
             "sample_sizes": sample_sizes,
             "medians": {
                 "Price/FCF": _median_of(series["Price/FCF"]),
+                "P/E": _median_of(series["P/E"]),
+                "P/B": _median_of(series["P/B"]),
                 "Debt-to-Equity": _median_of(series["Debt-to-Equity"]),
                 "Operating Margin": _median_of(series["Operating Margin"]),
                 "Profit Margin": _median_of(series["Profit Margin"]),
@@ -208,7 +250,7 @@ def build_industry_benchmarks(analyses: list[dict]) -> dict[str, Any]:
         }
 
     return {
-        "version": 1,
+        "version": 2,
         "peer_min_sample": PEER_MIN_SAMPLE,
         "industries": industries,
     }
@@ -241,10 +283,15 @@ def compare_to_peers(analysis: dict, benchmarks: dict | None) -> dict[str, Any]:
     """
     Relative standing vs industry medians.
 
-    Edges (good for value):
+    Non-financial edges:
       - Price/FCF vs industry < 80%
       - Debt/Equity vs industry < 80%
       - Operating (or profit) margin vs industry > 120%
+
+    Financial edges:
+      - P/E vs industry < 85%
+      - P/B vs industry < 90%
+      - ROE vs industry > 110%
 
     Robustness rule: if peers are usable and the name is worse on EVERY
     available relative check, treat as a relative trap (exclude from gems).
@@ -252,6 +299,9 @@ def compare_to_peers(analysis: dict, benchmarks: dict | None) -> dict[str, Any]:
     """
     peer_m = analysis.get("peer_metrics") or {}
     industry = peer_m.get("industry") or "Unknown"
+    financial = peer_m.get("is_financial") or analysis.get("is_financial") or is_financial_firm(
+        peer_m.get("sector") or analysis.get("sector"), industry
+    )
 
     empty = {
         "industry": industry,
@@ -262,6 +312,7 @@ def compare_to_peers(analysis: dict, benchmarks: dict | None) -> dict[str, Any]:
         "relative": {},
         "edges": {},
         "is_relative_trap": False,
+        "is_financial": financial,
         "summary": "Sin datos de peers / industria.",
     }
 
@@ -272,56 +323,112 @@ def compare_to_peers(analysis: dict, benchmarks: dict | None) -> dict[str, Any]:
     if not ind:
         return {
             **empty,
-            "summary": f"Sin benchmark para industria '{industry}'. Ejecuta un scan completo primero.",
+            "summary": (
+                f"Sin benchmark para industria '{industry}'. "
+                f"Ejecuta un scan completo primero."
+            ),
         }
 
     medians = ind.get("medians") or {}
     sample_sizes = ind.get("sample_sizes") or {}
 
-    p_fcf = peer_m.get("Price/FCF")
-    d_e = peer_m.get("Debt-to-Equity")
-    op_m = peer_m.get("Operating Margin")
-    # Prefer operating margin; fall back to net profit margin vs its industry median
-    margin_company = op_m if op_m is not None else peer_m.get("Profit Margin")
-    margin_med_key = "Operating Margin" if op_m is not None else "Profit Margin"
-    margin_med = medians.get(margin_med_key)
-
-    rel_p_fcf = _pct_of_industry(p_fcf, medians.get("Price/FCF"))
-    rel_de = _pct_of_industry(d_e, medians.get("Debt-to-Equity"))
-    rel_margin = _pct_of_industry(margin_company, margin_med)
-
-    # Only count a check when both company and industry median exist and sample OK
-    checks: list[tuple[str, bool | None]] = []
-
     def sample_ok(metric: str) -> bool:
         return sample_sizes.get(metric, 0) >= PEER_MIN_SAMPLE and medians.get(metric) is not None
 
-    edges = {
-        "cheap_vs_industry": False,
-        "less_levered_vs_industry": False,
-        "higher_margin_vs_industry": False,
-    }
+    checks: list[tuple[str, bool | None]] = []
+    edges: dict[str, bool] = {}
+    relative: dict[str, Any] = {"industry_medians": {}}
 
-    if sample_ok("Price/FCF") and rel_p_fcf is not None:
-        cheap = rel_p_fcf < P_FCF_VS_INDUSTRY_MAX
-        edges["cheap_vs_industry"] = cheap
-        checks.append(("valuation", cheap))
+    if financial:
+        pe = peer_m.get("P/E")
+        pb = peer_m.get("P/B")
+        roe = peer_m.get("ROE")
+        rel_pe = _pct_of_industry(pe, medians.get("P/E"))
+        rel_pb = _pct_of_industry(pb, medians.get("P/B"))
+        rel_roe = _pct_of_industry(roe, medians.get("ROE"))
 
-    if sample_ok("Debt-to-Equity") and rel_de is not None:
-        less_debt = rel_de < DEBT_EQUITY_VS_INDUSTRY_MAX
-        edges["less_levered_vs_industry"] = less_debt
-        checks.append(("leverage", less_debt))
+        relative.update(
+            {
+                "P/E_vs_industry": rel_pe,
+                "P/B_vs_industry": rel_pb,
+                "ROE_vs_industry": rel_roe,
+            }
+        )
+        relative["industry_medians"] = {
+            "P/E": medians.get("P/E"),
+            "P/B": medians.get("P/B"),
+            "ROE": medians.get("ROE"),
+        }
 
-    margin_sample_key = margin_med_key
-    if sample_ok(margin_sample_key) and rel_margin is not None:
-        better_margin = rel_margin > MARGIN_VS_INDUSTRY_MIN
-        edges["higher_margin_vs_industry"] = better_margin
-        checks.append(("margin", better_margin))
+        edges = {
+            "cheap_vs_industry": False,
+            "lower_pb_vs_industry": False,
+            "higher_roe_vs_industry": False,
+        }
 
-    usable = len(checks) >= 2  # need at least two relative dimensions
+        if sample_ok("P/E") and rel_pe is not None:
+            cheap = rel_pe < PE_VS_INDUSTRY_MAX
+            edges["cheap_vs_industry"] = cheap
+            checks.append(("valuation", cheap))
+
+        if sample_ok("P/B") and rel_pb is not None:
+            lower_pb = rel_pb < PB_VS_INDUSTRY_MAX
+            edges["lower_pb_vs_industry"] = lower_pb
+            checks.append(("book", lower_pb))
+
+        if sample_ok("ROE") and rel_roe is not None:
+            better_roe = rel_roe > ROE_VS_INDUSTRY_MIN
+            edges["higher_roe_vs_industry"] = better_roe
+            checks.append(("roe", better_roe))
+    else:
+        p_fcf = peer_m.get("Price/FCF")
+        d_e = peer_m.get("Debt-to-Equity")
+        op_m = peer_m.get("Operating Margin")
+        margin_company = op_m if op_m is not None else peer_m.get("Profit Margin")
+        margin_med_key = "Operating Margin" if op_m is not None else "Profit Margin"
+        margin_med = medians.get(margin_med_key)
+
+        rel_p_fcf = _pct_of_industry(p_fcf, medians.get("Price/FCF"))
+        rel_de = _pct_of_industry(d_e, medians.get("Debt-to-Equity"))
+        rel_margin = _pct_of_industry(margin_company, margin_med)
+
+        relative.update(
+            {
+                "Price/FCF_vs_industry": rel_p_fcf,
+                "Debt/Equity_vs_industry": rel_de,
+                "Margin_vs_industry": rel_margin,
+            }
+        )
+        relative["industry_medians"] = {
+            "Price/FCF": medians.get("Price/FCF"),
+            "Debt-to-Equity": medians.get("Debt-to-Equity"),
+            "Operating Margin": medians.get("Operating Margin"),
+            "Profit Margin": medians.get("Profit Margin"),
+        }
+
+        edges = {
+            "cheap_vs_industry": False,
+            "less_levered_vs_industry": False,
+            "higher_margin_vs_industry": False,
+        }
+
+        if sample_ok("Price/FCF") and rel_p_fcf is not None:
+            cheap = rel_p_fcf < P_FCF_VS_INDUSTRY_MAX
+            edges["cheap_vs_industry"] = cheap
+            checks.append(("valuation", cheap))
+
+        if sample_ok("Debt-to-Equity") and rel_de is not None:
+            less_debt = rel_de < DEBT_EQUITY_VS_INDUSTRY_MAX
+            edges["less_levered_vs_industry"] = less_debt
+            checks.append(("leverage", less_debt))
+
+        if sample_ok(margin_med_key) and rel_margin is not None:
+            better_margin = rel_margin > MARGIN_VS_INDUSTRY_MIN
+            edges["higher_margin_vs_industry"] = better_margin
+            checks.append(("margin", better_margin))
+
+    usable = len(checks) >= 2
     edge_score = sum(1 for _, ok in checks if ok)
-
-    # Relative trap: usable peers and worse on every available check
     is_trap = usable and len(checks) > 0 and all(ok is False for _, ok in checks)
 
     if not usable:
@@ -332,10 +439,16 @@ def compare_to_peers(analysis: dict, benchmarks: dict | None) -> dict[str, Any]:
         )
     elif is_trap:
         status = "relative_trap"
-        summary = (
-            f"Peor que la mediana de '{industry}' en valoración, deuda y márgenes "
-            f"relativos disponibles (posible trampa de valor)."
-        )
+        if financial:
+            summary = (
+                f"Peor que la mediana de '{industry}' en P/E, P/B y ROE "
+                f"relativos disponibles (posible trampa de valor)."
+            )
+        else:
+            summary = (
+                f"Peor que la mediana de '{industry}' en valoración, deuda y márgenes "
+                f"relativos disponibles (posible trampa de valor)."
+            )
     elif edge_score >= 2:
         status = "strong_peer_edge"
         summary = f"Ventaja relativa clara vs '{industry}' ({edge_score}/{len(checks)} checks)."
@@ -349,22 +462,13 @@ def compare_to_peers(analysis: dict, benchmarks: dict | None) -> dict[str, Any]:
     return {
         "industry": industry,
         "sector": peer_m.get("sector"),
+        "is_financial": financial,
         "status": status,
         "usable": usable,
         "edge_score": edge_score,
         "max_edges": len(checks),
         "industry_sample_size": ind.get("sample_size"),
-        "relative": {
-            "Price/FCF_vs_industry": rel_p_fcf,
-            "Debt/Equity_vs_industry": rel_de,
-            "Margin_vs_industry": rel_margin,
-            "industry_medians": {
-                "Price/FCF": medians.get("Price/FCF"),
-                "Debt-to-Equity": medians.get("Debt-to-Equity"),
-                "Operating Margin": medians.get("Operating Margin"),
-                "Profit Margin": medians.get("Profit Margin"),
-            },
-        },
+        "relative": relative,
         "edges": edges,
         "is_relative_trap": is_trap,
         "summary": summary,
@@ -390,11 +494,19 @@ def format_peer_section(peer_comparison: dict | None) -> list[str]:
         f"Summary: {peer_comparison.get('summary', '')}",
     ]
     rel = peer_comparison.get("relative") or {}
-    for label, key in (
-        ("P/FCF vs industry", "Price/FCF_vs_industry"),
-        ("D/E vs industry", "Debt/Equity_vs_industry"),
-        ("Margin vs industry", "Margin_vs_industry"),
-    ):
+    if peer_comparison.get("is_financial"):
+        metric_labels = (
+            ("P/E vs industry", "P/E_vs_industry"),
+            ("P/B vs industry", "P/B_vs_industry"),
+            ("ROE vs industry", "ROE_vs_industry"),
+        )
+    else:
+        metric_labels = (
+            ("P/FCF vs industry", "Price/FCF_vs_industry"),
+            ("D/E vs industry", "Debt/Equity_vs_industry"),
+            ("Margin vs industry", "Margin_vs_industry"),
+        )
+    for label, key in metric_labels:
         val = rel.get(key)
         if isinstance(val, (int, float)):
             lines.append(f"{label}: {val:.0%} of industry median")
